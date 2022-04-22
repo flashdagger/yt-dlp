@@ -1,6 +1,8 @@
 import binascii
 import io
 import re
+from collections.abc import Sequence
+from math import ceil
 
 from .external import FFmpegFD
 from .fragment import FragmentFD
@@ -9,6 +11,49 @@ from ..compat import compat_urlparse
 from ..dependencies import Cryptodome_AES
 from ..downloader import get_suitable_downloader
 from ..utils import bug_reports_message, parse_m3u8_attributes, update_url_query
+
+
+def try_merge(fragments, min_size=1):
+    """ try to coalsce fragments into at least min_size fragments
+        raises AssertionError
+    """
+    assert isinstance(fragments, Sequence), 'fragments must be Sequence type'
+    assert len(fragments) >= min_size >= 1, 'not enough fragments'
+    assert all(fragment.keys() == fragments[0].keys() for fragment in fragments), \
+        'fragments differ by keys'
+    assert all(fragment['url'] == fragments[0]['url'] for fragment in fragments), \
+        'fragments have different urls'
+    assert all((fragment['decrypt_info'] == {'METHOD': 'NONE'} for fragment in fragments)), \
+        'fragments are encrypted'
+    branges = [fragment.get('byte_range') for fragment in fragments]
+    assert all({'start', 'end'}.issubset(set(brange.keys())) for brange in branges), \
+        'there are fragments without valid byterange'
+    assert all(_prev['end'] == _next['start'] for _prev, _next in
+               zip(branges, branges[1:])), 'fragments have non-contiguous byterange'
+
+    for chunk_size in (ceil(len(fragments) / min_size), len(fragments) // min_size):
+        num_chunks = ceil(len(fragments) / chunk_size)
+        if chunk_size > 1 and num_chunks >= min_size:
+            break
+    else:
+        raise AssertionError('not enough fragments')
+
+    merged = []
+    for idx in range(0, len(fragments), chunk_size):
+        chunks = fragments[idx:idx + chunk_size]
+        if len(chunks) >= 2:
+            merged.append({**chunks[0], **{'byte_range': dict(
+                start=chunks[0]['byte_range']['start'],
+                end=chunks[-1]['byte_range']['end'])}
+            })
+        else:
+            merged.extend(chunks)
+
+    # reindex fragments
+    for idx, fragment in enumerate(merged, 1):
+        fragment.update(dict(frag_index=idx, media_sequence=idx))
+
+    return merged
 
 
 class HlsFD(FragmentFD):
@@ -208,14 +253,6 @@ class HlsFD(FragmentFD):
                     })
                     media_sequence += 1
 
-                    if map_info.get('BYTERANGE'):
-                        splitted_byte_range = map_info.get('BYTERANGE').split('@')
-                        sub_range_start = int(splitted_byte_range[1]) if len(splitted_byte_range) == 2 else byte_range['end']
-                        byte_range = {
-                            'start': sub_range_start,
-                            'end': sub_range_start + int(splitted_byte_range[0]),
-                        }
-
                 elif line.startswith('#EXT-X-KEY'):
                     decrypt_url = decrypt_info.get('URI')
                     decrypt_info = parse_m3u8_attributes(line[11:])
@@ -250,6 +287,15 @@ class HlsFD(FragmentFD):
         # We only download the first fragment during the test
         if self.params.get('test', False):
             fragments = [fragments[0] if fragments else None]
+
+        try:
+            len_orig = len(fragments)
+            fragments = try_merge(
+                fragments, min_size=self.params.get('concurrent_fragment_downloads', 1))
+            self.to_screen(f'[{self.FD_NAME}] Merged {len_orig} fragments into {len(fragments)}')
+            ctx['total_frags'] = len(fragments)
+        except AssertionError as exc:
+            self.report_warning(f'[{self.FD_NAME}] Cannot merge fragments because {exc}.')
 
         if real_downloader:
             info_dict['fragments'] = fragments
