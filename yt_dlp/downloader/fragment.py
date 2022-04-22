@@ -258,6 +258,7 @@ class FragmentFD(FileDownloader):
             if ctx_id is not None and s.get('ctx_id') != ctx_id:
                 return
 
+            state['fragment_count'] = ctx['total_frags']
             state['max_progress'] = ctx.get('max_progress')
             state['progress_idx'] = ctx.get('progress_idx')
 
@@ -268,7 +269,7 @@ class FragmentFD(FileDownloader):
             if not ctx['live']:
                 estimated_size = (
                     (ctx['complete_frags_downloaded_bytes'] + frag_total_bytes)
-                    / (state['fragment_index'] + 1) * total_frags)
+                    / (state['fragment_index'] + 1) * ctx['total_frags'])
                 state['total_bytes_estimate'] = estimated_size
 
             if s['status'] == 'finished':
